@@ -5,12 +5,13 @@ from unittest.mock import patch, Mock
 import pytest
 
 from homeassistant import data_entry_flow
-from homeassistant.components import zone
+from homeassistant.components import zone, geofency
 from homeassistant.components.geofency import (
-    CONF_MOBILE_BEACONS, DOMAIN)
+    CONF_MOBILE_BEACONS, DOMAIN, TRACKER_UPDATE)
 from homeassistant.const import (
     HTTP_OK, HTTP_UNPROCESSABLE_ENTITY, STATE_HOME,
     STATE_NOT_HOME)
+from homeassistant.helpers.dispatcher import DATA_DISPATCHER
 from homeassistant.setup import async_setup_component
 from homeassistant.util import slugify
 
@@ -112,34 +113,34 @@ def mock_dev_track(mock_device_tracker_conf):
 
 
 @pytest.fixture
-def geofency_client(loop, hass, aiohttp_client):
+async def geofency_client(loop, hass, aiohttp_client):
     """Geofency mock client (unauthenticated)."""
-    assert loop.run_until_complete(async_setup_component(
-        hass, 'persistent_notification', {}))
+    assert await async_setup_component(
+        hass, 'persistent_notification', {})
 
-    assert loop.run_until_complete(async_setup_component(
+    assert await async_setup_component(
         hass, DOMAIN, {
             DOMAIN: {
                 CONF_MOBILE_BEACONS: ['Car 1']
-            }}))
-
-    loop.run_until_complete(hass.async_block_till_done())
+            }})
+    await hass.async_block_till_done()
 
     with patch('homeassistant.components.device_tracker.update_config'):
-        yield loop.run_until_complete(aiohttp_client(hass.http.app))
+        return await aiohttp_client(hass.http.app)
 
 
 @pytest.fixture(autouse=True)
-def setup_zones(loop, hass):
+async def setup_zones(loop, hass):
     """Set up Zone config in HA."""
-    assert loop.run_until_complete(async_setup_component(
+    assert await async_setup_component(
         hass, zone.DOMAIN, {
             'zone': {
                 'name': 'Home',
                 'latitude': HOME_LATITUDE,
                 'longitude': HOME_LONGITUDE,
                 'radius': 100,
-            }}))
+            }})
+    await hass.async_block_till_done()
 
 
 @pytest.fixture
@@ -155,6 +156,7 @@ async def webhook_id(hass, geofency_client):
         result['flow_id'], {})
     assert result['type'] == data_entry_flow.RESULT_TYPE_CREATE_ENTRY
 
+    await hass.async_block_till_done()
     return result['result'].data['webhook_id']
 
 
@@ -281,3 +283,27 @@ async def test_beacon_enter_and_exit_car(hass, geofency_client, webhook_id):
     state_name = hass.states.get('{}.{}'.format(
         'device_tracker', device_name)).state
     assert STATE_HOME == state_name
+
+
+@pytest.mark.xfail(
+    reason='The device_tracker component does not support unloading yet.'
+)
+async def test_load_unload_entry(hass, geofency_client, webhook_id):
+    """Test that the appropriate dispatch signals are added and removed."""
+    url = '/api/webhook/{}'.format(webhook_id)
+
+    # Enter the Home zone
+    req = await geofency_client.post(url, data=GPS_ENTER_HOME)
+    await hass.async_block_till_done()
+    assert req.status == HTTP_OK
+    device_name = slugify(GPS_ENTER_HOME['device'])
+    state_name = hass.states.get('{}.{}'.format(
+        'device_tracker', device_name)).state
+    assert STATE_HOME == state_name
+    assert len(hass.data[DATA_DISPATCHER][TRACKER_UPDATE]) == 1
+
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+
+    assert await geofency.async_unload_entry(hass, entry)
+    await hass.async_block_till_done()
+    assert not hass.data[DATA_DISPATCHER][TRACKER_UPDATE]

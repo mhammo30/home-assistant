@@ -5,7 +5,6 @@ import logging
 import os
 from collections import OrderedDict, namedtuple
 from glob import glob
-from platform import system
 from typing import Dict, List, Sequence
 from unittest.mock import patch
 
@@ -22,8 +21,6 @@ from homeassistant.util import yaml
 from homeassistant.exceptions import HomeAssistantError
 
 REQUIREMENTS = ('colorlog==4.0.2',)
-if system() == 'Windows':  # Ensure colorama installed for colorlog on Windows
-    REQUIREMENTS += ('colorama<=1',)
 
 _LOGGER = logging.getLogger(__name__)
 # pylint: disable=protected-access
@@ -323,8 +320,8 @@ def check_ha_config_file(hass):
         core_config = {}
 
     # Merge packages
-    merge_packages_config(
-        hass, config, core_config.get(CONF_PACKAGES, {}), _pack_error)
+    hass.loop.run_until_complete(merge_packages_config(
+        hass, config, core_config.get(CONF_PACKAGES, {}), _pack_error))
     core_config.pop(CONF_PACKAGES, None)
 
     # Filter out repeating config sections
@@ -332,8 +329,16 @@ def check_ha_config_file(hass):
 
     # Process and validate config
     for domain in components:
-        component = loader.get_component(hass, domain)
-        if not component:
+        try:
+            integration = hass.loop.run_until_complete(
+                loader.async_get_integration(hass, domain))
+        except loader.IntegrationNotFound:
+            result.add_error("Integration not found: {}".format(domain))
+            continue
+
+        try:
+            component = integration.get_component()
+        except ImportError:
             result.add_error("Component not found: {}".format(domain))
             continue
 
@@ -345,14 +350,21 @@ def check_ha_config_file(hass):
                 _comp_error(ex, domain, config)
                 continue
 
-        if not hasattr(component, 'PLATFORM_SCHEMA'):
+        if (not hasattr(component, 'PLATFORM_SCHEMA') and
+                not hasattr(component, 'PLATFORM_SCHEMA_BASE')):
             continue
 
         platforms = []
         for p_name, p_config in config_per_platform(config, domain):
             # Validate component specific platform schema
             try:
-                p_validated = component.PLATFORM_SCHEMA(p_config)
+                if hasattr(component, 'PLATFORM_SCHEMA_BASE'):
+                    p_validated = \
+                        component.PLATFORM_SCHEMA_BASE(  # type: ignore
+                            p_config)
+                else:
+                    p_validated = component.PLATFORM_SCHEMA(  # type: ignore
+                        p_config)
             except vol.Invalid as ex:
                 _comp_error(ex, domain, config)
                 continue
@@ -364,9 +376,18 @@ def check_ha_config_file(hass):
                 platforms.append(p_validated)
                 continue
 
-            platform = loader.get_platform(hass, domain, p_name)
+            try:
+                p_integration = hass.loop.run_until_complete(
+                    loader.async_get_integration(hass, p_name))
+            except loader.IntegrationNotFound:
+                result.add_error(
+                    "Integration {} not found when trying to verify its {} "
+                    "platform.".format(p_name, domain))
+                continue
 
-            if platform is None:
+            try:
+                platform = p_integration.get_platform(domain)
+            except ImportError:
                 result.add_error(
                     "Platform not found: {}.{}".format(domain, p_name))
                 continue

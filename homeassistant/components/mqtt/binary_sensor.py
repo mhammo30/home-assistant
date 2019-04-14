@@ -1,53 +1,44 @@
-"""
-Support for MQTT binary sensors.
-
-For more details about this platform, please refer to the documentation at
-https://home-assistant.io/components/binary_sensor.mqtt/
-"""
+"""Support for MQTT binary sensors."""
 import logging
 
 import voluptuous as vol
 
-from homeassistant.core import callback
-from homeassistant.components import mqtt, binary_sensor
+from homeassistant.components import binary_sensor, mqtt
 from homeassistant.components.binary_sensor import (
-    BinarySensorDevice, DEVICE_CLASSES_SCHEMA)
+    DEVICE_CLASSES_SCHEMA, BinarySensorDevice)
 from homeassistant.const import (
-    CONF_FORCE_UPDATE, CONF_NAME, CONF_VALUE_TEMPLATE, CONF_PAYLOAD_ON,
-    CONF_PAYLOAD_OFF, CONF_DEVICE_CLASS, CONF_DEVICE)
-from homeassistant.components.mqtt import (
-    ATTR_DISCOVERY_HASH, CONF_QOS, CONF_STATE_TOPIC, MqttAttributes,
-    MqttAvailability, MqttDiscoveryUpdate, MqttEntityDeviceInfo, subscription)
-from homeassistant.components.mqtt.discovery import (
-    MQTT_DISCOVERY_NEW, clear_discovery_hash)
+    CONF_DEVICE, CONF_DEVICE_CLASS, CONF_FORCE_UPDATE, CONF_NAME,
+    CONF_PAYLOAD_OFF, CONF_PAYLOAD_ON, CONF_VALUE_TEMPLATE)
+from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 import homeassistant.helpers.event as evt
-from homeassistant.helpers.typing import HomeAssistantType, ConfigType
+from homeassistant.helpers.typing import ConfigType, HomeAssistantType
+
+from . import (
+    ATTR_DISCOVERY_HASH, CONF_QOS, CONF_STATE_TOPIC, CONF_UNIQUE_ID,
+    MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
+    MqttEntityDeviceInfo, subscription)
+from .discovery import MQTT_DISCOVERY_NEW, clear_discovery_hash
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NAME = 'MQTT Binary sensor'
 CONF_OFF_DELAY = 'off_delay'
-CONF_UNIQUE_ID = 'unique_id'
 DEFAULT_PAYLOAD_OFF = 'OFF'
 DEFAULT_PAYLOAD_ON = 'ON'
 DEFAULT_FORCE_UPDATE = False
 
-DEPENDENCIES = ['mqtt']
-
 PLATFORM_SCHEMA = mqtt.MQTT_RO_PLATFORM_SCHEMA.extend({
-    vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-    vol.Optional(CONF_PAYLOAD_OFF, default=DEFAULT_PAYLOAD_OFF): cv.string,
-    vol.Optional(CONF_PAYLOAD_ON, default=DEFAULT_PAYLOAD_ON): cv.string,
+    vol.Optional(CONF_DEVICE): mqtt.MQTT_ENTITY_DEVICE_INFO_SCHEMA,
     vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
     vol.Optional(CONF_FORCE_UPDATE, default=DEFAULT_FORCE_UPDATE): cv.boolean,
+    vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     vol.Optional(CONF_OFF_DELAY):
         vol.All(vol.Coerce(int), vol.Range(min=0)),
-    # Integrations should never expose unique_id through configuration.
-    # This is an exception because MQTT is a message transport, not a protocol
+    vol.Optional(CONF_PAYLOAD_OFF, default=DEFAULT_PAYLOAD_OFF): cv.string,
+    vol.Optional(CONF_PAYLOAD_ON, default=DEFAULT_PAYLOAD_ON): cv.string,
     vol.Optional(CONF_UNIQUE_ID): cv.string,
-    vol.Optional(CONF_DEVICE): mqtt.MQTT_ENTITY_DEVICE_INFO_SCHEMA,
 }).extend(mqtt.MQTT_AVAILABILITY_SCHEMA.schema).extend(
     mqtt.MQTT_JSON_ATTRS_SCHEMA.schema)
 
@@ -63,9 +54,9 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     async def async_discover(discovery_payload):
         """Discover and add a MQTT binary sensor."""
         try:
-            discovery_hash = discovery_payload[ATTR_DISCOVERY_HASH]
+            discovery_hash = discovery_payload.pop(ATTR_DISCOVERY_HASH)
             config = PLATFORM_SCHEMA(discovery_payload)
-            await _async_setup_entity(config, async_add_entities,
+            await _async_setup_entity(config, async_add_entities, config_entry,
                                       discovery_hash)
         except Exception:
             if discovery_hash:
@@ -77,16 +68,18 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         async_discover)
 
 
-async def _async_setup_entity(config, async_add_entities, discovery_hash=None):
+async def _async_setup_entity(config, async_add_entities, config_entry=None,
+                              discovery_hash=None):
     """Set up the MQTT binary sensor."""
-    async_add_entities([MqttBinarySensor(config, discovery_hash)])
+    async_add_entities([MqttBinarySensor(config, config_entry,
+                                         discovery_hash)])
 
 
 class MqttBinarySensor(MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
                        MqttEntityDeviceInfo, BinarySensorDevice):
     """Representation a binary sensor that is updated by MQTT."""
 
-    def __init__(self, config, discovery_hash):
+    def __init__(self, config, config_entry, discovery_hash):
         """Initialize the MQTT binary sensor."""
         self._config = config
         self._unique_id = config.get(CONF_UNIQUE_ID)
@@ -100,7 +93,7 @@ class MqttBinarySensor(MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
         MqttAvailability.__init__(self, config)
         MqttDiscoveryUpdate.__init__(self, discovery_hash,
                                      self.discovery_update)
-        MqttEntityDeviceInfo.__init__(self, device_config)
+        MqttEntityDeviceInfo.__init__(self, device_config, config_entry)
 
     async def async_added_to_hass(self):
         """Subscribe mqtt events."""
@@ -113,8 +106,9 @@ class MqttBinarySensor(MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
         self._config = config
         await self.attributes_discovery_update(config)
         await self.availability_discovery_update(config)
+        await self.device_info_discovery_update(config)
         await self._subscribe_topics()
-        self.async_schedule_update_ha_state()
+        self.async_write_ha_state()
 
     async def _subscribe_topics(self):
         """(Re)Subscribe to topics."""
@@ -127,24 +121,25 @@ class MqttBinarySensor(MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
             """Switch device off after a delay."""
             self._delay_listener = None
             self._state = False
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
         @callback
-        def state_message_received(_topic, payload, _qos):
+        def state_message_received(msg):
             """Handle a new received MQTT state message."""
+            payload = msg.payload
             value_template = self._config.get(CONF_VALUE_TEMPLATE)
             if value_template is not None:
                 payload = value_template.async_render_with_possible_json_value(
                     payload, variables={'entity_id': self.entity_id})
-            if payload == self._config.get(CONF_PAYLOAD_ON):
+            if payload == self._config[CONF_PAYLOAD_ON]:
                 self._state = True
-            elif payload == self._config.get(CONF_PAYLOAD_OFF):
+            elif payload == self._config[CONF_PAYLOAD_OFF]:
                 self._state = False
             else:  # Payload is not for this entity
                 _LOGGER.warning('No matching payload found'
                                 ' for entity: %s with state_topic: %s',
-                                self._config.get(CONF_NAME),
-                                self._config.get(CONF_STATE_TOPIC))
+                                self._config[CONF_NAME],
+                                self._config[CONF_STATE_TOPIC])
                 return
 
             if self._delay_listener is not None:
@@ -156,13 +151,13 @@ class MqttBinarySensor(MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
                 self._delay_listener = evt.async_call_later(
                     self.hass, off_delay, off_delay_listener)
 
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
         self._sub_state = await subscription.async_subscribe_topics(
             self.hass, self._sub_state,
-            {'state_topic': {'topic': self._config.get(CONF_STATE_TOPIC),
+            {'state_topic': {'topic': self._config[CONF_STATE_TOPIC],
                              'msg_callback': state_message_received,
-                             'qos': self._config.get(CONF_QOS)}})
+                             'qos': self._config[CONF_QOS]}})
 
     async def async_will_remove_from_hass(self):
         """Unsubscribe when removed."""
@@ -179,7 +174,7 @@ class MqttBinarySensor(MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
     @property
     def name(self):
         """Return the name of the binary sensor."""
-        return self._config.get(CONF_NAME)
+        return self._config[CONF_NAME]
 
     @property
     def is_on(self):
@@ -194,7 +189,7 @@ class MqttBinarySensor(MqttAttributes, MqttAvailability, MqttDiscoveryUpdate,
     @property
     def force_update(self):
         """Force update."""
-        return self._config.get(CONF_FORCE_UPDATE)
+        return self._config[CONF_FORCE_UPDATE]
 
     @property
     def unique_id(self):
